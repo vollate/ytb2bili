@@ -1,0 +1,58 @@
+# yt2bili default configuration
+# Copy to the platform-specific config directory and customize:
+#   Linux:   $XDG_CONFIG_HOME/yt2bili/config.yaml  (default ~/.config/yt2bili/)
+#   macOS:   $XDG_CONFIG_HOME/yt2bili/config.yaml  (default ~/.config/yt2bili/)
+#   Windows: %APPDATA%/yt2bili/config.yaml
+
+schedule:
+  poll_interval_minutes: 15
+  max_concurrent_downloads: 2
+  max_concurrent_uploads: 1
+  max_retries: 3
+  retry_backoff_base: 2.0
+
+download:
+  quality: best
+  subtitle_langs:
+    - zh-Hans
+    - en
+    - ja
+  # Default: $XDG_DATA_HOME/yt2bili/downloads (Linux/macOS) or %LOCALAPPDATA%/yt2bili/downloads (Windows)
+  # download_dir: /custom/path/to/downloads
+
+subtitle:
+  subtitle_generator: none   # whisper | cloud | none
+  whisper_model: base
+  whisper_device: auto
+  subtitle_fallback_generate: true
+
+upload:
+  bilibili_tid: 17
+  tags:
+    - 搬运
+    - YouTube
+  title_template: "{original_title}"
+  desc_template: "搬运自YouTube: {youtube_url}\n\n{original_description}"
+  copyright: 2
+  delete_after_upload: false
+
+webui:
+  host: 127.0.0.1
+  port: 8080
+  secret: change-me
+
+notify:
+  webhook_url: null
+  notify_on:
+    - completed
+    - failed
+
+# Network proxy settings
+# proxy:
+#   http_proxy: "http://127.0.0.1:7890"
+#   https_proxy: "http://127.0.0.1:7890"   # defaults to http_proxy if omitted
+#   no_proxy: "localhost,127.0.0.1"
+
+# Default: sqlite+aiosqlite:///$XDG_DATA_HOME/yt2bili/yt2bili.db (Linux/macOS)
+#          sqlite+aiosqlite:///%LOCALAPPDATA%/yt2bili/yt2bili.db (Windows)
+# database_url: "sqlite+aiosqlite:///custom/path/yt2bili.db"
