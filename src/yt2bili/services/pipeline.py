@@ -33,11 +33,13 @@ class VideoDownloader(Protocol):
     async def download(
         self,
         youtube_id: str,
-        download_dir: Path,
-        *,
-        progress_cb: ProgressCallback | None = None,
+        output_dir: Path,
+        quality: Any,
+        subtitle_langs: list[str],
+        progress_callback: ProgressCallback | None = None,
+        stats_callback: Callable[[dict], None] | None = None,
     ) -> DownloadResult:
-        """Download video. *progress_cb* is called with 0–100 values."""
+        """Download video. *progress_callback* is called with 0–100 values."""
         ...
 
 
@@ -108,12 +110,14 @@ class Pipeline:
         upload_service: UploadService,
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
+        download_stats: dict[int, dict] | None = None,
     ) -> None:
         self._downloader = downloader
         self._subtitle_service = subtitle_service
         self._upload_service = upload_service
         self._session_factory = session_factory
         self._config = config
+        self._download_stats = download_stats
 
     # ── public entry point ──────────────────────────────────────────────
 
@@ -195,11 +199,46 @@ class Pipeline:
                 )
                 await session.commit()
 
+        def _raw_stats_cb(raw: dict) -> None:
+            if self._download_stats is not None:
+                self._download_stats[task_id] = raw
+
+        # Resolve per-channel quality / subtitle overrides
+        async with self._session_factory() as session:
+            stmt2 = (
+                select(Task)
+                .where(Task.id == task_id)
+                .options(selectinload(Task.video).selectinload(Video.channel))
+            )
+            result2 = await session.execute(stmt2)
+            task2 = result2.scalar_one_or_none()
+            if task2 is None:
+                raise ValueError(f"Task {task_id} not found (2nd load)")
+            overrides = task2.video.channel.get_config_overrides()
+            await session.commit()
+
+        from yt2bili.core.enums import VideoQuality
+
+        quality_str = overrides.get("quality") or self._config.download.quality.value
+        try:
+            quality = VideoQuality(quality_str)
+        except ValueError:
+            quality = self._config.download.quality
+
+        subtitle_langs = overrides.get("subtitle_langs") or self._config.download.subtitle_langs
+
         result: DownloadResult = await self._downloader.download(
             youtube_id,
             download_dir,
-            progress_cb=_dl_progress,
+            quality,
+            subtitle_langs,
+            progress_callback=_dl_progress,
+            stats_callback=_raw_stats_cb if self._download_stats is not None else None,
         )
+
+        # Clear download stats now that the download phase is complete
+        if self._download_stats is not None:
+            self._download_stats.pop(task_id, None)
 
         # (d) Update task paths
         async with self._session_factory() as session:

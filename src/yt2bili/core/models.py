@@ -49,7 +49,9 @@ class Channel(Base):
         DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
-    videos: Mapped[list[Video]] = relationship("Video", back_populates="channel", lazy="selectin")
+    videos: Mapped[list[Video]] = relationship(
+        "Video", back_populates="channel", lazy="selectin", cascade="all, delete-orphan"
+    )
 
     def get_config_overrides(self) -> dict[str, Any]:
         """Parse JSON config_overrides field."""
@@ -89,7 +91,9 @@ class Video(Base):
     )
 
     channel: Mapped[Channel] = relationship("Channel", back_populates="videos")
-    tasks: Mapped[list[Task]] = relationship("Task", back_populates="video", lazy="selectin")
+    tasks: Mapped[list[Task]] = relationship(
+        "Task", back_populates="video", lazy="selectin", cascade="all, delete-orphan"
+    )
 
 
 class Task(Base):

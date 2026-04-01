@@ -254,7 +254,7 @@ class TestProxyInOpts:
     """Verify yt-dlp opts include proxy when configured."""
 
     def test_proxy_added_to_opts(self) -> None:
-        config = AppConfig(proxy=ProxyConfig(http_proxy="http://proxy:3128"))
+        config = AppConfig(proxy=ProxyConfig(enabled=True, proxy_type="http", host="proxy", port=3128))
         downloader = VideoDownloader(config)
         opts = downloader._build_opts(
             quality=VideoQuality.BEST,
@@ -267,8 +267,10 @@ class TestProxyInOpts:
     def test_proxy_prefers_https(self) -> None:
         config = AppConfig(
             proxy=ProxyConfig(
-                http_proxy="http://a:80",
-                https_proxy="http://b:443",
+                enabled=True,
+                proxy_type="https",
+                host="b",
+                port=443,
             )
         )
         downloader = VideoDownloader(config)
@@ -278,7 +280,7 @@ class TestProxyInOpts:
             outtmpl="/tmp/test/%(id)s.%(ext)s",
             progress_callback=None,
         )
-        assert opts["proxy"] == "http://b:443"
+        assert opts["proxy"] == "https://b:443"
 
     def test_no_proxy_key_when_unset(self) -> None:
         downloader = VideoDownloader(AppConfig())

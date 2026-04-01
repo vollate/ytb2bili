@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING
 
 import structlog
@@ -26,6 +27,8 @@ class SchedulerService:
         self._config = config
         self._scheduler = AsyncIOScheduler()
         self._running: bool = False
+        self._last_check_time: datetime.datetime | None = None
+        self._last_new_videos_count: int = 0
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -47,6 +50,8 @@ class SchedulerService:
         """Shut down the scheduler gracefully."""
         if self._running:
             self._scheduler.shutdown(wait=False)
+            # Replace with a fresh instance so start() can be called again later
+            self._scheduler = AsyncIOScheduler()
             self._running = False
             logger.info("scheduler_stopped")
 
@@ -54,6 +59,10 @@ class SchedulerService:
         """Immediately trigger a full channel check (outside the schedule)."""
         logger.info("scheduler_trigger_now")
         await self._run_check_all()
+
+    async def check_all(self) -> None:
+        """Alias for :meth:`trigger_now` (called by the web UI callback)."""
+        await self.trigger_now()
 
     # ── per-channel job management ──────────────────────────────────────
 
@@ -89,6 +98,8 @@ class SchedulerService:
         """Wrapper around monitor.check_all_channels with error handling."""
         try:
             new_videos = await self._monitor.check_all_channels()
+            self._last_check_time = datetime.datetime.now(tz=datetime.timezone.utc)
+            self._last_new_videos_count = len(new_videos)
             logger.info("scheduled_check_complete", new_video_count=len(new_videos))
         except Exception:
             logger.exception("scheduled_check_failed")
@@ -113,3 +124,13 @@ class SchedulerService:
     def running(self) -> bool:
         """Return whether the scheduler is currently running."""
         return self._running
+
+    @property
+    def last_check_time(self) -> datetime.datetime | None:
+        """UTC datetime of the most recent completed check, or ``None``."""
+        return self._last_check_time
+
+    @property
+    def last_new_videos_count(self) -> int:
+        """Number of new videos found during the last completed check."""
+        return self._last_new_videos_count

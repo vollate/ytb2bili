@@ -137,7 +137,12 @@ class Repository:
         status: TaskStatus | None = None,
         limit: int = 50,
     ) -> Sequence[Task]:
-        stmt = select(Task).order_by(Task.created_at.desc()).limit(limit)
+        stmt = (
+            select(Task)
+            .options(selectinload(Task.video).selectinload(Video.channel))
+            .order_by(Task.created_at.desc())
+            .limit(limit)
+        )
         if status is not None:
             stmt = stmt.where(Task.status == status)
         result = await self._session.execute(stmt)
@@ -222,23 +227,70 @@ class Repository:
 
     # ── Aggregate queries ──────────────────────────────────────────────
 
+    async def count_videos(
+        self,
+        channel_id: int | None = None,
+        status: TaskStatus | None = None,
+        search: str | None = None,
+    ) -> int:
+        """Count videos matching the given filters."""
+        from sqlalchemy import func as sa_func
+        from sqlalchemy import select as sa_select
+
+        stmt = sa_select(sa_func.count()).select_from(Video)
+        if channel_id is not None:
+            stmt = stmt.where(Video.channel_id == channel_id)
+        if status is not None:
+            stmt = stmt.join(Task, Task.video_id == Video.id).where(Task.status == status)
+        if search:
+            stmt = stmt.where(Video.title.ilike(f"%{search}%"))
+        result = await self._session.execute(stmt)
+        return result.scalar_one()
+
     async def list_videos_with_tasks(
         self,
         channel_id: int | None = None,
         status: TaskStatus | None = None,
         limit: int = 50,
+        offset: int = 0,
+        search: str | None = None,
+        sort_by: str = "date",
     ) -> Sequence[Video]:
-        """List videos with eagerly-loaded tasks, optionally filtered by channel and task status."""
+        """List videos with eagerly-loaded tasks, optionally filtered by channel and task status.
+
+        Parameters
+        ----------
+        sort_by:
+            ``"date"`` — newest first (``youtube_upload_date`` then ``created_at``),
+            ``"title"`` — alphabetical by video title,
+            ``"added"`` — by DB insertion time (``Video.created_at``).
+        """
+        from sqlalchemy import asc, desc, func as sa_func
+
         stmt = (
             select(Video)
             .options(selectinload(Video.tasks), selectinload(Video.channel))
-            .order_by(Video.created_at.desc())
             .limit(limit)
+            .offset(offset)
         )
         if channel_id is not None:
             stmt = stmt.where(Video.channel_id == channel_id)
         if status is not None:
             stmt = stmt.join(Task, Task.video_id == Video.id).where(Task.status == status)
+        if search:
+            pattern = f"%{search}%"
+            stmt = stmt.where(Video.title.ilike(pattern))
+
+        if sort_by == "title":
+            stmt = stmt.order_by(asc(Video.title))
+        elif sort_by == "added":
+            stmt = stmt.order_by(desc(Video.created_at))
+        else:  # default: "date"
+            stmt = stmt.order_by(
+                desc(Video.youtube_upload_date).nulls_last(),
+                desc(Video.created_at),
+            )
+
         result = await self._session.execute(stmt)
         return result.scalars().unique().all()
 

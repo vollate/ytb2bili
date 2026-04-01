@@ -63,16 +63,19 @@ def _make_downloader(
     async def _download(
         youtube_id: str,
         download_dir: Path,
+        quality: Any = None,
+        subtitle_langs: Any = None,
         *,
-        progress_cb: ProgressCallback | None = None,
+        progress_callback: ProgressCallback | None = None,
+        stats_callback: Any = None,
     ) -> DownloadResult:
         if error:
             raise error
-        if progress_cb is not None:
-            result = progress_cb(50.0)
+        if progress_callback is not None:
+            result = progress_callback(50.0)
             if hasattr(result, "__await__"):
                 await result
-            result = progress_cb(100.0)
+            result = progress_callback(100.0)
             if hasattr(result, "__await__"):
                 await result
         return DownloadResult(

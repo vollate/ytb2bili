@@ -156,7 +156,7 @@ async def test_check_channel_skips_existing_videos() -> None:
 
 @pytest.mark.asyncio
 async def test_check_channel_raises_on_http_error() -> None:
-    """MonitorError should be raised when the HTTP request fails."""
+    """HTTP errors in a feed are caught by gather(return_exceptions=True) and result in 0 new videos."""
     repo = _mock_repo()
     config = AppConfig()
     monitor = ChannelMonitor(repo=repo, config=config)
@@ -174,8 +174,10 @@ async def test_check_channel_raises_on_http_error() -> None:
         MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
         MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        with pytest.raises(MonitorError):
-            await monitor.check_channel(channel)
+        # check_channel uses asyncio.gather with return_exceptions=True,
+        # so feed errors are swallowed and we get an empty result.
+        result = await monitor.check_channel(channel)
+        assert result == []
 
 
 @pytest.mark.asyncio
@@ -258,7 +260,7 @@ async def test_check_all_channels_continues_on_error() -> None:
 async def test_check_channel_passes_proxy_to_httpx() -> None:
     """httpx.AsyncClient should receive proxies from config."""
     repo = _mock_repo()
-    config = AppConfig(proxy=ProxyConfig(http_proxy="http://proxy:3128"))
+    config = AppConfig(proxy=ProxyConfig(enabled=True, proxy_type="http", host="proxy", port=3128))
     monitor = ChannelMonitor(repo=repo, config=config)
     channel = _make_channel()
 

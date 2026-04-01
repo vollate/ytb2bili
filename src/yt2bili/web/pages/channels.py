@@ -26,12 +26,8 @@ def register_channels_page(
 ) -> None:
     """Build the channels management UI inside the current NiceGUI page context."""
 
-    channel_list_container = ui.element("div").classes("w-full")
-    stats_label = ui.label("").classes("text-sm text-grey-6")
-
-    # ── state ─────────────────────────────────────────────────────────
+    _containers: dict[str, Any] = {}
     _search_query: dict[str, str] = {"value": ""}
-    _sort_key: dict[str, str] = {"value": "name"}
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -40,44 +36,31 @@ def register_channels_page(
             repo = Repository(session)
             channels = list(await repo.list_channels())
 
-        # Stats row
+        # Stats
         total = len(channels)
         enabled = sum(1 for c in channels if c.enabled)
         disabled = total - enabled
-        stats_label.set_text(
+        _containers["stats_label"].set_text(
             _("channels.stats", total=str(total), enabled=str(enabled), disabled=str(disabled))
         )
 
-        # Filter
+        # Filter by search
         query = _search_query["value"].lower().strip()
         if query:
             channels = [
-                c
-                for c in channels
+                c for c in channels
                 if query in c.name.lower() or query in c.youtube_channel_id.lower()
             ]
 
-        # Sort
-        sort = _sort_key["value"]
-        if sort == "name":
-            channels.sort(key=lambda c: c.name.lower())
-        elif sort == "last_checked":
-            channels.sort(
-                key=lambda c: c.last_checked_at or __import__("datetime").datetime.min,
-                reverse=True,
-            )
-        elif sort == "video_count":
-            channels.sort(
-                key=lambda c: len(c.videos) if hasattr(c, "videos") and c.videos else 0,
-                reverse=True,
-            )
+        # Sort by name
+        channels.sort(key=lambda c: c.name.lower())
 
-        channel_list_container.clear()
-        with channel_list_container:
+        _containers["channel_list"].clear()
+        with _containers["channel_list"]:
             if not channels:
                 ui.label(_("channels.no_channels")).classes("text-grey-6")
             else:
-                with ui.row().classes("w-full flex-wrap gap-4"):
+                with ui.column().classes("w-full gap-3"):
                     for ch in channels:
                         avatar_url: str | None = None
                         if avatar_service is not None:
@@ -97,18 +80,6 @@ def register_channels_page(
             repo = Repository(session)
             await repo.update_channel(channel_id, ChannelUpdate(enabled=enabled))
             await repo.commit()
-        log.info("channel.toggled", channel_id=channel_id, enabled=enabled)
-        await _refresh()
-
-    async def _bulk_set_enabled(enabled: bool) -> None:
-        async with session_factory() as session:
-            repo = Repository(session)
-            channels = await repo.list_channels()
-            for ch in channels:
-                await repo.update_channel(ch.id, ChannelUpdate(enabled=enabled))
-            await repo.commit()
-        state = _("common.enabled") if enabled else _("common.disabled")
-        ui.notify(_("channels.toggled", state=state), type="positive")
         await _refresh()
 
     async def _delete_channel(channel_id: int) -> None:
@@ -116,7 +87,6 @@ def register_channels_page(
             repo = Repository(session)
             await repo.delete_channel(channel_id)
             await repo.commit()
-        log.info("channel.deleted", channel_id=channel_id)
         ui.notify(_("channels.deleted"), type="warning")
         await _refresh()
 
@@ -126,10 +96,10 @@ def register_channels_page(
         quality: str | None,
         tags: str,
         subtitle_langs: str,
+        rss_feeds: list[str],
         status_label_el: Any,
         dlg: Any,
     ) -> None:
-        """Resolve channel URL/ID, auto-fetch name if empty, then create."""
         from yt2bili.services.channel_resolver import resolve_channel
 
         channel_input = channel_input.strip()
@@ -146,25 +116,21 @@ def register_channels_page(
         if result is None:
             status_label_el.set_text("")
             status_label_el.set_visibility(False)
-            ui.notify(
-                _("channels.add_dialog.resolve_failed"),
-                type="negative",
-            )
+            ui.notify(_("channels.add_dialog.resolve_failed"), type="negative")
             return
 
         channel_id, auto_name = result
         display_name = name_override.strip() if name_override.strip() else auto_name
 
-        # Build optional config overrides
         overrides: dict[str, Any] = {}
         if quality and quality != "default":
             overrides["quality"] = quality
         if tags.strip():
             overrides["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
         if subtitle_langs.strip():
-            overrides["subtitle_langs"] = [
-                s.strip() for s in subtitle_langs.split(",") if s.strip()
-            ]
+            overrides["subtitle_langs"] = [s.strip() for s in subtitle_langs.split(",") if s.strip()]
+        if rss_feeds:
+            overrides["rss_feeds"] = rss_feeds
 
         async with session_factory() as session:
             repo = Repository(session)
@@ -182,11 +148,9 @@ def register_channels_page(
                 )
             )
             await repo.commit()
-        log.info("channel.added", youtube_channel_id=channel_id, name=display_name)
         ui.notify(_("channels.add_dialog.added", name=display_name), type="positive")
         dlg.close()
 
-        # Fetch avatar before refreshing so it's available for display
         if avatar_service is not None:
             await avatar_service.fetch_avatar(channel_id)
 
@@ -216,8 +180,23 @@ def register_channels_page(
                 _("channels.add_dialog.tags"), placeholder=_("channels.add_dialog.tags_placeholder")
             ).classes("w-full")
             sub_langs_input = ui.input(
-                _("channels.add_dialog.subtitle_langs"), placeholder=_("channels.add_dialog.subtitle_langs_placeholder")
+                _("channels.add_dialog.subtitle_langs"),
+                placeholder=_("channels.add_dialog.subtitle_langs_placeholder"),
             ).classes("w-full")
+
+            ui.separator()
+            ui.label(_("channels.add_dialog.rss_feeds_label")).classes("text-xs text-grey-6 mb-1")
+            ui.label(_("channels.add_dialog.rss_feeds_hint")).classes("text-xs text-grey-5 mb-2")
+            _rss_selection: dict[str, bool] = {"all": True, "videos": True, "shorts": True, "live": True}
+            with ui.row().classes("gap-4"):
+                for feed_type, label_key in [
+                    ("all", "channels.rss.all"),
+                    ("videos", "channels.rss.videos"),
+                    ("shorts", "channels.rss.shorts"),
+                    ("live", "channels.rss.live"),
+                ]:
+                    cb = ui.checkbox(_(label_key), value=True)
+                    cb.on("update:model-value", lambda e, ft=feed_type: _rss_selection.update({ft: bool(e.value)}))
 
             status_label_el = ui.label("").classes("text-sm text-blue-6")
             status_label_el.set_visibility(False)
@@ -227,11 +206,12 @@ def register_channels_page(
                 ui.button(
                     _("common.add"),
                     on_click=lambda: _add_channel_resolved(
-                        channel_input.value,  # type: ignore[arg-type]
-                        name_input.value,  # type: ignore[arg-type]
-                        quality_select.value,  # type: ignore[arg-type]
-                        tags_input.value,  # type: ignore[arg-type]
-                        sub_langs_input.value,  # type: ignore[arg-type]
+                        channel_input.value,
+                        name_input.value,
+                        quality_select.value,
+                        tags_input.value,
+                        sub_langs_input.value,
+                        [ft for ft, v in _rss_selection.items() if v],
                         status_label_el,
                         dlg,
                     ),
@@ -253,7 +233,6 @@ def register_channels_page(
                 ui.label(_("channels.edit_dialog.title", name=channel.name)).classes("text-lg font-bold mb-2")
                 ui.label(_("channels.edit_dialog.overrides_label")).classes("text-xs text-grey-6 mb-2")
 
-                # Quality dropdown
                 quality_options = [q.value for q in VideoQuality]
                 current_quality = overrides.get("quality", "")
                 quality_select = ui.select(
@@ -262,9 +241,7 @@ def register_channels_page(
                     label=_("channels.edit_dialog.quality"),
                     clearable=True,
                 ).classes("w-full")
-                quality_select.props(f'placeholder="{_("channels.edit_dialog.using_default")}"')
 
-                # Tags
                 current_tags = overrides.get("tags", [])
                 tags_input = ui.input(
                     _("channels.edit_dialog.tags"),
@@ -272,7 +249,6 @@ def register_channels_page(
                     placeholder=_("channels.edit_dialog.using_default"),
                 ).classes("w-full")
 
-                # Subtitle languages
                 current_sub = overrides.get("subtitle_langs", [])
                 sub_langs_input = ui.input(
                     _("channels.edit_dialog.subtitle_langs"),
@@ -280,7 +256,6 @@ def register_channels_page(
                     placeholder=_("channels.edit_dialog.using_default"),
                 ).classes("w-full")
 
-                # Bilibili TID
                 current_tid = overrides.get("bilibili_tid")
                 tid_input = ui.number(
                     _("channels.edit_dialog.tid"),
@@ -288,48 +263,69 @@ def register_channels_page(
                     placeholder=_("channels.edit_dialog.using_default"),
                 ).classes("w-full")
 
-                # Title template
                 title_tpl_input = ui.input(
                     _("channels.edit_dialog.title_template"),
                     value=overrides.get("title_template", ""),
                     placeholder=_("channels.edit_dialog.using_default"),
                 ).classes("w-full")
 
-                # Description template
                 desc_tpl_input = ui.textarea(
                     _("channels.edit_dialog.desc_template"),
                     value=overrides.get("desc_template", ""),
                     placeholder=_("channels.edit_dialog.using_default"),
                 ).classes("w-full").props("rows=3")
 
+                # RSS feed types
+                ui.separator()
+                ui.label(_("channels.edit_dialog.rss_feeds")).classes("text-xs text-grey-6 mb-1")
+                current_feeds: list[str] = overrides.get("rss_feeds") or ["all", "videos", "shorts", "live"]
+                _edit_rss: dict[str, bool] = {ft: ft in current_feeds for ft in ["all", "videos", "shorts", "live"]}
+                with ui.row().classes("gap-4"):
+                    for feed_type, label_key in [
+                        ("all", "channels.rss.all"),
+                        ("videos", "channels.rss.videos"),
+                        ("shorts", "channels.rss.shorts"),
+                        ("live", "channels.rss.live"),
+                    ]:
+                        cb = ui.checkbox(_(label_key), value=feed_type in current_feeds)
+                        cb.on("update:model-value", lambda e, ft=feed_type: _edit_rss.update({ft: bool(e.value)}))
+
+                current_extra: list[str] = overrides.get("extra_playlists") or []
+                extra_playlists_input = ui.textarea(
+                    _("channels.edit_dialog.rss_extra_playlists"),
+                    value="\n".join(current_extra),
+                    placeholder=_("channels.edit_dialog.rss_extra_playlists_placeholder"),
+                ).classes("w-full").props("rows=4")
+
                 async def _save() -> None:
                     new_overrides: dict[str, Any] = {}
                     if quality_select.value:
                         new_overrides["quality"] = quality_select.value
-                    tags_val: str = tags_input.value or ""  # type: ignore[assignment]
+                    tags_val: str = tags_input.value or ""
                     if tags_val.strip():
-                        new_overrides["tags"] = [
-                            t.strip() for t in tags_val.split(",") if t.strip()
-                        ]
-                    sub_val: str = sub_langs_input.value or ""  # type: ignore[assignment]
+                        new_overrides["tags"] = [t.strip() for t in tags_val.split(",") if t.strip()]
+                    sub_val: str = sub_langs_input.value or ""
                     if sub_val.strip():
-                        new_overrides["subtitle_langs"] = [
-                            s.strip() for s in sub_val.split(",") if s.strip()
-                        ]
+                        new_overrides["subtitle_langs"] = [s.strip() for s in sub_val.split(",") if s.strip()]
                     if tid_input.value is not None:
                         new_overrides["bilibili_tid"] = int(tid_input.value)
-                    title_val: str = title_tpl_input.value or ""  # type: ignore[assignment]
+                    title_val: str = title_tpl_input.value or ""
                     if title_val.strip():
                         new_overrides["title_template"] = title_val.strip()
-                    desc_val: str = desc_tpl_input.value or ""  # type: ignore[assignment]
+                    desc_val: str = desc_tpl_input.value or ""
                     if desc_val.strip():
                         new_overrides["desc_template"] = desc_val.strip()
+                    selected_feeds = [ft for ft, v in _edit_rss.items() if v]
+                    if selected_feeds and set(selected_feeds) != {"all", "videos", "shorts", "live"}:
+                        new_overrides["rss_feeds"] = selected_feeds
+                    extra_raw: str = extra_playlists_input.value or ""
+                    extra_ids = [line.strip() for line in extra_raw.splitlines() if line.strip()]
+                    if extra_ids:
+                        new_overrides["extra_playlists"] = extra_ids
 
                     async with session_factory() as sess:
                         r = Repository(sess)
-                        await r.update_channel(
-                            channel_id, ChannelUpdate(config_overrides=new_overrides)
-                        )
+                        await r.update_channel(channel_id, ChannelUpdate(config_overrides=new_overrides))
                         await r.commit()
                     ui.notify(_("channels.edit_dialog.saved"), type="positive")
                     dlg.close()
@@ -344,62 +340,24 @@ def register_channels_page(
 
     # ── page layout ──────────────────────────────────────────────────────
 
-    with ui.column().classes("w-full p-4 gap-4"):
+    with ui.column().classes("w-full p-4 gap-4 max-w-4xl mx-auto"):
         with ui.row().classes("w-full items-center justify-between"):
-            ui.label(_("channels.title")).classes("text-2xl font-bold")
+            with ui.row().classes("items-center gap-2"):
+                ui.label(_("channels.title")).classes("text-2xl font-bold")
+                _containers["stats_label"] = ui.label("").classes("text-sm text-grey-6")
             with ui.row().classes("gap-2"):
-                ui.button(_("channels.refresh"), icon="refresh", on_click=_refresh).props("flat")
-                ui.button(_("channels.add"), icon="add", on_click=_open_add_dialog).props(
-                    "color=primary"
-                )
+                search_input = ui.input(
+                    placeholder=_("channels.search_placeholder"),
+                ).classes("w-56").props("dense clearable outlined")
 
-        # Stats row
-        stats_label  # noqa: B018
+                def _on_search(e: Any) -> None:
+                    _search_query["value"] = e.value or ""
 
-        # Search + Sort + Bulk actions
-        with ui.row().classes("w-full items-center gap-4"):
-            search_input = ui.input(
-                _("channels.search_label"), placeholder=_("channels.search_placeholder")
-            ).classes("flex-1").props('dense clearable outlined')
+                search_input.on("update:model-value", _on_search)
+                search_input.on("update:model-value", lambda _: _refresh())
 
-            def _on_search(e: Any) -> None:
-                _search_query["value"] = e.value or ""
+                ui.button(_("channels.add"), icon="add", on_click=_open_add_dialog).props("color=primary")
 
-            search_input.on("update:model-value", _on_search)
-            search_input.on(
-                "update:model-value",
-                lambda _: _refresh(),  # type: ignore[arg-type, return-value]
-            )
-
-            sort_select = ui.select(
-                {
-                    "name": _("channels.sort.name"),
-                    "last_checked": _("channels.sort.last_checked"),
-                    "video_count": _("channels.sort.video_count"),
-                },
-                value="name",
-                label=_("channels.sort_by"),
-            ).classes("w-40").props("dense outlined")
-
-            def _on_sort(e: Any) -> None:
-                _sort_key["value"] = e.value or "name"
-
-            sort_select.on(
-                "update:model-value",
-                _on_sort,
-            )
-            sort_select.on(
-                "update:model-value",
-                lambda _: _refresh(),  # type: ignore[arg-type, return-value]
-            )
-
-            ui.button(_("channels.enable_all"), on_click=lambda: _bulk_set_enabled(True)).props(
-                "flat dense"
-            )
-            ui.button(_("channels.disable_all"), on_click=lambda: _bulk_set_enabled(False)).props(
-                "flat dense"
-            )
-
-        channel_list_container  # noqa: B018
+        _containers["channel_list"] = ui.element("div").classes("w-full")
 
     ui.timer(interval=0.1, callback=_refresh, once=True)

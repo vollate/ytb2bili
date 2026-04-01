@@ -54,9 +54,10 @@ def test_app_config_all_defaults() -> None:
     assert cfg.notify.webhook_url is None
     assert cfg.notify.notify_on == ["completed", "failed"]
 
-    assert cfg.proxy.http_proxy is None
-    assert cfg.proxy.https_proxy is None
-    assert cfg.proxy.no_proxy is None
+    assert cfg.proxy.enabled is False
+    assert cfg.proxy.host == ""
+    assert cfg.proxy.port == 0
+    assert cfg.proxy.no_proxy == ""
 
     assert "sqlite" in cfg.database_url
 
@@ -218,54 +219,68 @@ def test_download_config_quality_enum() -> None:
 class TestProxyConfig:
     """Tests for ProxyConfig helper methods."""
 
-    def test_defaults_are_none(self) -> None:
+    def test_defaults_disabled(self) -> None:
         pc = ProxyConfig()
-        assert pc.http_proxy is None
-        assert pc.https_proxy is None
-        assert pc.no_proxy is None
+        assert pc.enabled is False
+        assert pc.proxy_type == "http"
+        assert pc.host == ""
+        assert pc.port == 0
+        assert pc.auth_enabled is False
 
     def test_to_httpx_proxy_returns_none_when_unset(self) -> None:
         assert ProxyConfig().to_httpx_proxy() is None
 
-    def test_to_httpx_proxy_http_only(self) -> None:
-        pc = ProxyConfig(http_proxy="http://proxy:8080")
+    def test_to_url_returns_none_when_disabled(self) -> None:
+        pc = ProxyConfig(enabled=False, host="proxy", port=3128)
+        assert pc.to_url() is None
+
+    def test_to_url_returns_none_when_no_host(self) -> None:
+        pc = ProxyConfig(enabled=True, host="", port=3128)
+        assert pc.to_url() is None
+
+    def test_to_httpx_proxy_http(self) -> None:
+        pc = ProxyConfig(enabled=True, proxy_type="http", host="proxy", port=8080)
         assert pc.to_httpx_proxy() == "http://proxy:8080"
 
-    def test_to_httpx_proxy_both_prefers_https(self) -> None:
-        pc = ProxyConfig(
-            http_proxy="http://proxy:8080",
-            https_proxy="http://secure-proxy:8443",
-        )
-        assert pc.to_httpx_proxy() == "http://secure-proxy:8443"
+    def test_to_httpx_proxy_socks5(self) -> None:
+        pc = ProxyConfig(enabled=True, proxy_type="socks5", host="proxy", port=1080)
+        assert pc.to_httpx_proxy() == "socks5://proxy:1080"
 
-    def test_to_httpx_proxy_https_only(self) -> None:
-        pc = ProxyConfig(https_proxy="http://secure:443")
-        assert pc.to_httpx_proxy() == "http://secure:443"
+    def test_to_url_with_auth(self) -> None:
+        pc = ProxyConfig(
+            enabled=True, proxy_type="http", host="proxy", port=8080,
+            auth_enabled=True, username="user", password="pass",
+        )
+        assert pc.to_url() == "http://user:pass@proxy:8080"
+
+    def test_to_url_auth_disabled_ignores_credentials(self) -> None:
+        pc = ProxyConfig(
+            enabled=True, proxy_type="http", host="proxy", port=8080,
+            auth_enabled=False, username="user", password="pass",
+        )
+        assert pc.to_url() == "http://proxy:8080"
 
     def test_to_ytdlp_proxy_returns_none_when_unset(self) -> None:
         assert ProxyConfig().to_ytdlp_proxy() is None
 
-    def test_to_ytdlp_proxy_prefers_https(self) -> None:
-        pc = ProxyConfig(
-            http_proxy="http://a:80",
-            https_proxy="http://b:443",
-        )
-        assert pc.to_ytdlp_proxy() == "http://b:443"
-
-    def test_to_ytdlp_proxy_falls_back_to_http(self) -> None:
-        pc = ProxyConfig(http_proxy="http://a:80")
-        assert pc.to_ytdlp_proxy() == "http://a:80"
+    def test_to_ytdlp_proxy_returns_url(self) -> None:
+        pc = ProxyConfig(enabled=True, proxy_type="https", host="secure", port=443)
+        assert pc.to_ytdlp_proxy() == "https://secure:443"
 
     def test_proxy_config_from_yaml(self, tmp_path: Path) -> None:
         yaml_content = """\
 proxy:
-  http_proxy: "http://myproxy:3128"
-  https_proxy: "http://myproxy:3129"
+  enabled: true
+  proxy_type: "http"
+  host: "myproxy"
+  port: 3128
   no_proxy: "localhost,127.0.0.1"
 """
         cfg_file = tmp_path / "proxy.yaml"
         cfg_file.write_text(yaml_content, encoding="utf-8")
         cfg = load_config(cfg_file)
-        assert cfg.proxy.http_proxy == "http://myproxy:3128"
-        assert cfg.proxy.https_proxy == "http://myproxy:3129"
+        assert cfg.proxy.enabled is True
+        assert cfg.proxy.host == "myproxy"
+        assert cfg.proxy.port == 3128
         assert cfg.proxy.no_proxy == "localhost,127.0.0.1"
+        assert cfg.proxy.to_url() == "http://myproxy:3128"

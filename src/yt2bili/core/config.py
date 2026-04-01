@@ -32,6 +32,7 @@ class DownloadConfig(BaseModel):
     quality: VideoQuality = VideoQuality.BEST
     subtitle_langs: list[str] = Field(default_factory=lambda: ["zh-Hans", "en", "ja"])
     download_dir: Path = Field(default_factory=default_download_dir)
+    youtube_cookies_file: str | None = None
 
 
 class SubtitleConfig(BaseModel):
@@ -66,25 +67,37 @@ class WebUIConfig(BaseModel):
 class ProxyConfig(BaseModel):
     """Network proxy settings."""
 
-    http_proxy: str | None = None
-    https_proxy: str | None = None
-    no_proxy: str | None = None
+    enabled: bool = False
+    proxy_type: str = "http"  # "http" | "https" | "socks5"
+    host: str = ""
+    port: int = 0
+    auth_enabled: bool = False
+    username: str = ""
+    password: str = ""
+    no_proxy: str = ""
+
+    def to_url(self) -> str | None:
+        """Build the full proxy URL, or ``None`` if disabled / no host."""
+        if not self.enabled or not self.host:
+            return None
+        scheme = self.proxy_type
+        auth = f"{self.username}:{self.password}@" if self.auth_enabled and self.username else ""
+        port_part = f":{self.port}" if self.port else ""
+        return f"{scheme}://{auth}{self.host}{port_part}"
 
     def to_httpx_proxy(self) -> str | None:
         """Return a single proxy URL for ``httpx.AsyncClient(proxy=...)``.
 
-        httpx ≥ 0.28 uses ``proxy=`` (single URL) instead of the old
-        ``proxies=`` dict.  Returns ``None`` when no proxy is configured.
+        Returns ``None`` when no proxy is configured.
         """
-        return self.https_proxy or self.http_proxy
+        return self.to_url()
 
     def to_ytdlp_proxy(self) -> str | None:
         """Return the proxy string for yt-dlp's ``proxy`` option.
 
-        Prefers ``https_proxy``, falls back to ``http_proxy``.
         Returns ``None`` when no proxy is configured.
         """
-        return self.https_proxy or self.http_proxy
+        return self.to_url()
 
 
 class NotifyConfig(BaseModel):
@@ -107,6 +120,12 @@ class ChannelConfig(BaseModel):
     title_template: str | None = None
     desc_template: str | None = None
     enabled: bool | None = None
+    rss_feeds: list[str] | None = None
+    """Which RSS feed types to poll: subset of ``["all", "videos", "shorts", "live"]``.
+    Defaults to all four when ``None``."""
+    extra_playlists: list[str] | None = None
+    """Additional arbitrary playlist IDs (e.g. ``["PLxxxx", "PLyyyy"]``) to poll
+    in addition to the standard feed types above."""
 
 
 # ── Root config ──────────────────────────────────────────────────────────────

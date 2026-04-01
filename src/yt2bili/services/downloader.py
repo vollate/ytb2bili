@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 from pathlib import Path
 
 import yt_dlp
@@ -53,6 +54,7 @@ class VideoDownloader:
         quality: VideoQuality,
         subtitle_langs: list[str],
         progress_callback: Callable[[float], Awaitable[None]] | None = None,
+        stats_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> DownloadResult:
         """Download a YouTube video and optional subtitles.
 
@@ -69,6 +71,11 @@ class VideoDownloader:
         progress_callback:
             Optional async callable receiving a float in ``[0, 40]``
             representing overall pipeline progress for the download phase.
+        stats_callback:
+            Optional sync callable receiving a dict with raw download stats:
+            ``{"speed": float|None, "eta": int|None, "downloaded_bytes": int,
+               "total_bytes": int}``.  Called synchronously in the yt-dlp hook
+            thread; must be non-blocking (e.g. writing to a plain dict).
 
         Returns
         -------
@@ -90,6 +97,7 @@ class VideoDownloader:
             subtitle_langs=subtitle_langs,
             outtmpl=outtmpl,
             progress_callback=progress_callback,
+            stats_callback=stats_callback,
         )
 
         url = f"https://www.youtube.com/watch?v={youtube_id}"
@@ -112,11 +120,12 @@ class VideoDownloader:
         subtitle_langs: list[str],
         outtmpl: str,
         progress_callback: Callable[[float], Awaitable[None]] | None,
+        stats_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict:
         """Construct the yt-dlp option dict."""
         hooks: list[Callable] = []
-        if progress_callback is not None:
-            hooks.append(self._make_progress_hook(progress_callback))
+        if progress_callback is not None or stats_callback is not None:
+            hooks.append(self._make_progress_hook(progress_callback, stats_callback))
 
         opts: dict = {
             "format": _quality_to_format(quality),
@@ -135,11 +144,16 @@ class VideoDownloader:
         if proxy is not None:
             opts["proxy"] = proxy
 
+        cookies_file = self._config.download.youtube_cookies_file
+        if cookies_file:
+            opts["cookiefile"] = cookies_file
+
         return opts
 
     @staticmethod
     def _make_progress_hook(
-        callback: Callable[[float], Awaitable[None]],
+        callback: Callable[[float], Awaitable[None]] | None,
+        stats_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Callable[[dict], None]:
         """Return a yt-dlp progress hook that maps download % to 0-40% range."""
         loop: asyncio.AbstractEventLoop | None = None
@@ -158,8 +172,17 @@ class VideoDownloader:
             else:
                 raw_pct = 0.0
             mapped = _PROGRESS_MIN + raw_pct * (_PROGRESS_MAX - _PROGRESS_MIN)
-            if loop is not None and loop.is_running():
+            if callback is not None and loop is not None and loop.is_running():
                 asyncio.run_coroutine_threadsafe(callback(mapped), loop)
+            if stats_callback is not None:
+                stats_callback(
+                    {
+                        "speed": d.get("speed"),
+                        "eta": d.get("eta"),
+                        "downloaded_bytes": downloaded,
+                        "total_bytes": total,
+                    }
+                )
 
         return hook
 

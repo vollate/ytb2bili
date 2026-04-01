@@ -14,34 +14,42 @@ from yt2bili.core.config import AppConfig
 from yt2bili.core.i18n import _, get_lang, set_lang
 from yt2bili.core.paths import cache_dir
 from yt2bili.services.avatar import AvatarService
-from yt2bili.web.pages.auth import register_auth_page
+from yt2bili.services.scheduler import SchedulerService
+from yt2bili.services.trigger import TriggerService
 from yt2bili.web.pages.channels import register_channels_page
-from yt2bili.web.pages.dashboard import register_dashboard_page
 from yt2bili.web.pages.settings import register_settings_page
 from yt2bili.web.pages.tasks import register_tasks_page
-from yt2bili.web.pages.videos import register_videos_page
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger()
 
 # ── Navigation items ────────────────────────────────────────────────────────
 
 _NAV_ITEMS: list[tuple[str, str, str]] = [
-    ("/", "nav.dashboard", "dashboard"),
+    ("/", "nav.tasks", "assignment"),
     ("/channels", "nav.channels", "subscriptions"),
-    ("/videos", "nav.videos", "video_library"),
-    ("/tasks", "nav.tasks", "list_alt"),
     ("/settings", "nav.settings", "settings"),
-    ("/auth", "nav.auth", "key"),
 ]
 
 
-def _common_layout(title_key: str) -> None:
-    """Render the shared header + left-drawer navigation."""
+def _common_layout(active_path: str) -> None:
+    """Render the shared top header with horizontal tab navigation."""
     with ui.header().classes("items-center justify-between px-4"):
-        ui.label(_("app.brand")).classes("text-xl font-bold text-white")
-        ui.label(_(title_key)).classes("text-sm text-white/70")
+        # Left: brand + nav tabs
+        with ui.row().classes("items-center gap-4"):
+            ui.label(_("app.brand")).classes("text-xl font-bold text-white")
+            for path, label_key, icon in _NAV_ITEMS:
+                is_active = active_path == path
+                btn = ui.button(
+                    _(label_key),
+                    icon=icon,
+                    on_click=lambda _, p=path: ui.navigate.to(p),
+                )
+                if is_active:
+                    btn.props("flat text-color=white").classes("text-white font-bold bg-white/20 rounded")
+                else:
+                    btn.props("flat text-color=white/70").classes("text-white/70")
 
-        # Language selector
+        # Right: language selector
         lang_options = {"en": "English", "zh-CN": "简体中文"}
 
         def _on_lang_change(e: Any) -> None:
@@ -54,19 +62,15 @@ def _common_layout(title_key: str) -> None:
             on_change=_on_lang_change,
         ).classes("text-white").props("dense borderless dark")
 
-    with ui.left_drawer(value=True).classes("bg-grey-2"):
-        ui.label(_("nav.navigation")).classes("text-xs text-grey-6 px-4 pt-4 pb-2")
-        for path, label_key, icon in _NAV_ITEMS:
-            ui.button(_(label_key), icon=icon, on_click=lambda _, p=path: ui.navigate.to(p)).props(
-                "flat align=left"
-            ).classes("w-full")
-
 
 class _AppState:
     """Mutable container shared between startup hook and page handlers."""
 
     session_factory: async_sessionmaker[AsyncSession] | None = None
     engine: Any = None
+    download_stats: dict[int, dict] | None = None
+    scheduler: SchedulerService | None = None
+    trigger_service: TriggerService | None = None
 
 
 _state = _AppState()
@@ -81,27 +85,7 @@ def create_app(
     *,
     config_path: Path | None = None,
 ) -> None:
-    """Configure NiceGUI pages and start the web server.
-
-    The database engine is initialised inside NiceGUI's own event loop via the
-    ``app.on_startup`` hook so there is no nested ``asyncio.run()`` conflict.
-
-    Parameters
-    ----------
-    config:
-        The validated application configuration.
-    session_factory:
-        Optional pre-built session factory.  When ``None`` (the normal CLI
-        path) the factory is created lazily on startup.
-    pipeline:
-        Optional pipeline service (for triggering manual uploads).
-    task_queue:
-        Optional task-queue service (for enqueuing check-all).
-    scheduler:
-        Optional APScheduler instance (for triggering immediate checks).
-    config_path:
-        Path to the YAML config file (for the settings page save).
-    """
+    """Configure NiceGUI pages and start the web server."""
 
     # Set the language from config
     set_lang(config.webui.language)
@@ -125,7 +109,68 @@ def create_app(
             _state.session_factory = create_session_factory(_state.engine)
             log.info("db.initialised", url=config.database_url)
 
+        _state.download_stats = {}
+
+        from yt2bili.services.downloader import VideoDownloader as _VideoDownloader
+        from yt2bili.services.pipeline import Pipeline
+        from yt2bili.services.subtitle import SubtitleService as _SubtitleService
+        from yt2bili.services.task_queue import TaskQueue
+
+        downloader = _VideoDownloader(config)
+        subtitle_svc = _SubtitleService(config)
+
+        try:
+            from yt2bili.services.uploader import UploadService as _UploadService
+            from yt2bili.core.schemas import UploadProgress
+            import collections.abc
+
+            class _NoOpBackend:
+                async def authenticate(self, credentials: dict) -> bool:
+                    return False
+
+                async def upload(self, *args: Any, **kwargs: Any) -> str:
+                    raise NotImplementedError("No uploader backend configured")
+
+                def progress(self) -> collections.abc.AsyncIterator[UploadProgress]:
+                    raise NotImplementedError("No uploader backend configured")
+
+            upload_svc = _UploadService(_NoOpBackend(), config)  # type: ignore[arg-type]
+        except Exception:
+            upload_svc = None  # type: ignore[assignment]
+
+        pipeline = Pipeline(
+            downloader,  # type: ignore[arg-type]
+            subtitle_svc,  # type: ignore[arg-type]
+            upload_svc,  # type: ignore[arg-type]
+            _state.session_factory,
+            config,
+            download_stats=_state.download_stats,
+        )
+        task_queue = TaskQueue(pipeline, _state.session_factory, config)
+        await task_queue.start_workers(config.schedule.max_concurrent_downloads)
+
+        trigger_svc = TriggerService(_state.session_factory, config, task_queue)
+
+        class _MonitorAdapter:
+            async def check_all_channels(self) -> list:
+                result = await trigger_svc.check_all_channels()
+                new_count = result.get("new_videos", 0)
+                return [None] * new_count
+
+        scheduler = SchedulerService(_MonitorAdapter(), config)  # type: ignore[arg-type]
+        scheduler.start()
+
+        _state.scheduler = scheduler
+        _state.trigger_service = trigger_svc
+        _state._task_queue = task_queue  # type: ignore[attr-defined]
+        log.info("services.initialised")
+
     async def _on_shutdown() -> None:
+        if _state.scheduler is not None:
+            _state.scheduler.stop()
+        task_queue = getattr(_state, "_task_queue", None)
+        if task_queue is not None:
+            await task_queue.stop()
         if _state.engine is not None:
             await _state.engine.dispose()
             log.info("db.disposed")
@@ -141,6 +186,13 @@ def create_app(
     elif task_queue is not None and hasattr(task_queue, "enqueue_check_all"):
         check_all_callback = task_queue.enqueue_check_all
 
+    def _get_check_all_callback() -> Callable[[], Any] | None:
+        if check_all_callback is not None:
+            return check_all_callback
+        if _state.trigger_service is not None:
+            return _state.trigger_service.check_all_channels
+        return None
+
     retry_callback: Callable[[int], Any] | None = None
     if task_queue is not None and hasattr(task_queue, "retry_task"):
         retry_callback = task_queue.retry_task
@@ -149,6 +201,20 @@ def create_app(
     if task_queue is not None and hasattr(task_queue, "cancel_task"):
         cancel_callback = task_queue.cancel_task
 
+    def _get_retry_callback() -> Callable[[int], Any] | None:
+        if retry_callback is not None:
+            return retry_callback
+        if _state.trigger_service is not None:
+            return _state.trigger_service.retry_task
+        return None
+
+    def _get_cancel_callback() -> Callable[[int], Any] | None:
+        if cancel_callback is not None:
+            return cancel_callback
+        if _state.trigger_service is not None:
+            return _state.trigger_service.cancel_task
+        return None
+
     # ── page registration ───────────────────────────────────────────────
 
     def _factory() -> async_sessionmaker[AsyncSession]:
@@ -156,38 +222,31 @@ def create_app(
         return _state.session_factory
 
     @ui.page("/")
-    def dashboard_page() -> None:
-        _common_layout("nav.dashboard")
-        register_dashboard_page(_factory(), check_all_callback=check_all_callback, avatar_service=avatar_service)
+    def tasks_page() -> None:
+        _common_layout("/")
+        register_tasks_page(
+            _factory(),
+            check_all_callback=_get_check_all_callback(),
+            retry_callback=_get_retry_callback(),
+            cancel_callback=_get_cancel_callback(),
+            scheduler=_state.scheduler,
+            download_stats=_state.download_stats,
+            config=config,
+        )
 
     @ui.page("/channels")
     def channels_page() -> None:
-        _common_layout("nav.channels")
+        _common_layout("/channels")
         register_channels_page(_factory(), config=config, avatar_service=avatar_service)
-
-    @ui.page("/videos")
-    def videos_page() -> None:
-        _common_layout("nav.videos")
-        register_videos_page(_factory())
-
-    @ui.page("/tasks")
-    def tasks_page() -> None:
-        _common_layout("nav.tasks")
-        register_tasks_page(
-            _factory(),
-            retry_callback=retry_callback,
-            cancel_callback=cancel_callback,
-        )
 
     @ui.page("/settings")
     def settings_page() -> None:
-        _common_layout("nav.settings")
-        register_settings_page(config, config_path=config_path)
-
-    @ui.page("/auth")
-    def auth_page() -> None:
-        _common_layout("nav.auth")
-        register_auth_page(_factory())
+        _common_layout("/settings")
+        register_settings_page(
+            config,
+            config_path=config_path,
+            session_factory=_factory(),
+        )
 
     log.info("webui.configured", host=config.webui.host, port=config.webui.port)
 
