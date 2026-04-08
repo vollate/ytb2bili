@@ -148,10 +148,10 @@ class TriggerService:
         return task
 
     async def retry_task(self, task_id: int) -> Task | None:
-        """Reset a FAILED task to PENDING and re-enqueue it.
+        """Reset a FAILED or CANCELLED task to PENDING and re-enqueue it.
 
         Returns the updated :class:`Task`, or ``None`` if the task was not
-        found or is not in FAILED status.
+        found or is not in a retryable status.
         """
         log = logger.bind(task_id=task_id)
         log.info("trigger.retry_task_start")
@@ -162,8 +162,8 @@ class TriggerService:
             if task is None:
                 log.warning("trigger.retry_task_not_found")
                 return None
-            if task.status != TaskStatus.FAILED:
-                log.warning("trigger.retry_task_not_failed", status=task.status.value)
+            if task.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                log.warning("trigger.retry_task_not_retryable", status=task.status.value)
                 return None
 
             await repo.update_task_status(task_id, TaskStatus.PENDING, progress_pct=0.0, error_message="")
@@ -180,12 +180,24 @@ class TriggerService:
         return task
 
     async def cancel_task(self, task_id: int) -> bool:
-        """Cancel a PENDING or RETRYING task.
+        """Cancel a PENDING, RETRYING, or active (DOWNLOADING/UPLOADING/SUBTITLING) task.
+
+        For active tasks the cancellation is delegated to the :class:`TaskQueue`
+        which cancels the running ``asyncio.Task`` and updates the DB status.
+        For queued tasks the status is set to CANCELLED directly.
 
         Returns ``True`` if the task was successfully cancelled.
         """
         log = logger.bind(task_id=task_id)
         log.info("trigger.cancel_task_start")
+
+        _CANCELLABLE = (
+            TaskStatus.PENDING,
+            TaskStatus.RETRYING,
+            TaskStatus.DOWNLOADING,
+            TaskStatus.SUBTITLING,
+            TaskStatus.UPLOADING,
+        )
 
         async with self._session_factory() as session:
             repo = Repository(session)
@@ -193,15 +205,20 @@ class TriggerService:
             if task is None:
                 log.warning("trigger.cancel_task_not_found")
                 return False
-            if task.status not in (TaskStatus.PENDING, TaskStatus.RETRYING):
+            if task.status not in _CANCELLABLE:
                 log.warning("trigger.cancel_task_invalid_status", status=task.status.value)
                 return False
 
-            await repo.update_task_status(task_id, TaskStatus.CANCELLED)
-            await session.commit()
-            log.info("trigger.cancel_task_done")
-
+        # For active tasks, delegate to task_queue which can cancel the running
+        # asyncio.Task and update the DB status atomically.
         if self._task_queue is not None:
             await self._task_queue.cancel_task(task_id)
+        else:
+            # No task queue — just update DB directly
+            async with self._session_factory() as session:
+                repo = Repository(session)
+                await repo.update_task_status(task_id, TaskStatus.CANCELLED)
+                await session.commit()
 
+        log.info("trigger.cancel_task_done")
         return True

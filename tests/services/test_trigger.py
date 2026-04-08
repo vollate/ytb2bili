@@ -313,7 +313,7 @@ async def test_retry_task_returns_none_when_not_found() -> None:
 
 @pytest.mark.asyncio
 async def test_cancel_task_updates_status() -> None:
-    """cancel_task should set a PENDING task to CANCELLED."""
+    """cancel_task should delegate to task_queue.cancel_task when available."""
     factory = _mock_session_factory()
     tq = _mock_task_queue()
     config = AppConfig()
@@ -330,7 +330,7 @@ async def test_cancel_task_updates_status() -> None:
         result = await svc.cancel_task(task_id=100)
 
     assert result is True
-    repo_instance.update_task_status.assert_awaited_once_with(100, TaskStatus.CANCELLED)
+    # When task_queue is present, status update is handled by task_queue.cancel_task
     tq.cancel_task.assert_awaited_once_with(100)
 
 

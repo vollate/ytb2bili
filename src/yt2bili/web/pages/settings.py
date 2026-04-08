@@ -9,7 +9,6 @@ from typing import Any
 import structlog
 import yaml
 from nicegui import ui
-from nicegui.events import UploadEventArguments
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from yt2bili.core.config import AppConfig
@@ -313,14 +312,6 @@ def register_settings_page(
         ui.notify(_("auth.youtube.file_saved"), type="positive")
         _refresh_yt_section()
 
-    async def _on_upload(e: UploadEventArguments) -> None:
-        dest = _get_cookies_path()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(e.content.read())
-        await _save_cookies_path(str(dest))
-        ui.notify(_("auth.youtube.file_saved"), type="positive")
-        _refresh_yt_section()
-
     async def _on_clear() -> None:
         p = _get_cookies_path()
         if p.exists():
@@ -359,11 +350,6 @@ def register_settings_page(
                     _("auth.youtube.save_text"), icon="save",
                     on_click=lambda: _save_cookies_text(cookie_editor.value or ""),
                 ).props("color=primary dense")
-
-                ui.upload(
-                    on_upload=_on_upload, auto_upload=True,
-                    label=_("auth.youtube.upload"),
-                ).props("accept=.txt").classes("max-w-xs")
 
                 if cookies_file:
                     ui.button(

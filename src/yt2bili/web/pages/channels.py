@@ -15,6 +15,7 @@ from yt2bili.core.schemas import ChannelCreate, ChannelUpdate
 from yt2bili.db.repository import Repository
 from yt2bili.services.avatar import AvatarService
 from yt2bili.web.components.channel_card import render_channel_card
+from yt2bili.web.state import Ref
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger()
 
@@ -27,7 +28,7 @@ def register_channels_page(
     """Build the channels management UI inside the current NiceGUI page context."""
 
     _containers: dict[str, Any] = {}
-    _search_query: dict[str, str] = {"value": ""}
+    search_query = Ref[str]("")
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -45,7 +46,7 @@ def register_channels_page(
         )
 
         # Filter by search
-        query = _search_query["value"].lower().strip()
+        query = search_query.value.lower().strip()
         if query:
             channels = [
                 c for c in channels
@@ -351,7 +352,7 @@ def register_channels_page(
                 ).classes("w-56").props("dense clearable outlined")
 
                 def _on_search(e: Any) -> None:
-                    _search_query["value"] = e.value or ""
+                    search_query.value = e.value or ""
 
                 search_input.on("update:model-value", _on_search)
                 search_input.on("update:model-value", lambda _: _refresh())

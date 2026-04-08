@@ -14,6 +14,7 @@ from yt2bili.core.enums import TaskStatus
 from yt2bili.core.i18n import _
 from yt2bili.db.repository import Repository
 from yt2bili.web.components.progress_bar import render_progress_bar
+from yt2bili.web.state import ListRef, Ref, SetRef
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger()
 
@@ -143,24 +144,23 @@ def register_tasks_page(
     _containers: dict[str, Any] = {}
 
     # ── State ────────────────────────────────────────────────────────────
-    _filter_tab: dict[str, str] = {"value": "all"}
-    _search: dict[str, str] = {"value": ""}
-    _sort_by: dict[str, str] = {"value": "latest"}
-    _view_mode: dict[str, str] = {"value": "list"}
-    _select_mode: dict[str, bool] = {"value": False}
-    _selected_ids: set[int] = set()
-    _page: dict[str, int] = {"value": 1}
-    _page_size: dict[str, int] = {"value": 20}
-    _total_count: dict[str, int] = {"value": 0}
-    _current_tasks: list[Any] = []
-    # Track which accordion item is expanded (by task id), only one at a time
-    _expanded_id: dict[str, int | None] = {"value": None}
-    # Status tab counts
-    _tab_counts: dict[str, int] = {"all": 0, "active": 0, "pending": 0, "completed": 0, "failed": 0}
+    filter_tab = Ref[str]("all")
+    search = Ref[str]("")
+    sort_by = Ref[str]("latest")
+    view_mode = Ref[str]("list")
+    select_mode = Ref[bool](False)
+    selected_ids = SetRef[int]()
+    page = Ref[int](1)
+    page_size = Ref[int](20)
+    total_count = Ref[int](0)
+    current_tasks = ListRef[Any]()
+    expanded_id = Ref[int | None](None)
+    tab_counts: dict[str, int] = {"all": 0, "active": 0, "pending": 0, "completed": 0, "failed": 0}
 
     # ── Callbacks ────────────────────────────────────────────────────────
 
-    async def _on_retry(task_id: int) -> None:
+    async def _do_retry(task_id: int) -> None:
+        """Execute retry without UI side effects (no notify, no refresh)."""
         if retry_callback is not None:
             result = retry_callback(task_id)
             if hasattr(result, "__await__"):
@@ -170,10 +170,9 @@ def register_tasks_page(
                 repo = Repository(session)
                 await repo.update_task_status(task_id, TaskStatus.PENDING, progress_pct=0.0)
                 await repo.commit()
-        ui.notify(_("tasks.retry_requested", task_id=str(task_id)), type="info")
-        await _refresh()
 
-    async def _on_cancel(task_id: int) -> None:
+    async def _do_cancel(task_id: int) -> None:
+        """Execute cancel without UI side effects (no notify, no refresh)."""
         if cancel_callback is not None:
             result = cancel_callback(task_id)
             if hasattr(result, "__await__"):
@@ -183,6 +182,14 @@ def register_tasks_page(
                 repo = Repository(session)
                 await repo.update_task_status(task_id, TaskStatus.CANCELLED)
                 await repo.commit()
+
+    async def _on_retry(task_id: int) -> None:
+        await _do_retry(task_id)
+        ui.notify(_("tasks.retry_requested", task_id=str(task_id)), type="info")
+        await _refresh()
+
+    async def _on_cancel(task_id: int) -> None:
+        await _do_cancel(task_id)
         ui.notify(_("tasks.cancel_requested", task_id=str(task_id)), type="warning")
         await _refresh()
 
@@ -203,67 +210,89 @@ def register_tasks_page(
         await _refresh()
 
     async def _batch_retry() -> None:
-        for task in _current_tasks:
-            if task.id in _selected_ids and task.status in _RETRYABLE_STATUSES:
-                await _on_retry(task.id)
+        """Retry all selected retryable tasks, then refresh once."""
+        for task in current_tasks:
+            if task.id in selected_ids and task.status in _RETRYABLE_STATUSES:
+                await _do_retry(task.id)
+        count = len(selected_ids)
+        selected_ids.clear()
+        ui.notify(_("tasks.batch.retry_selected") + f" ({count})", type="info")
+        await _refresh()
 
     async def _batch_cancel() -> None:
-        for task in _current_tasks:
-            if task.id in _selected_ids and task.status in _CANCELLABLE_STATUSES:
-                await _on_cancel(task.id)
+        """Cancel all selected cancellable tasks, then refresh once."""
+        for task in current_tasks:
+            if task.id in selected_ids and task.status in _CANCELLABLE_STATUSES:
+                await _do_cancel(task.id)
+        count = len(selected_ids)
+        selected_ids.clear()
+        ui.notify(_("tasks.batch.cancel_selected") + f" ({count})", type="warning")
+        await _refresh()
 
     def _toggle_select(task_id: int, selected: bool) -> None:
         if selected:
-            _selected_ids.add(task_id)
+            selected_ids.add(task_id)
         else:
-            _selected_ids.discard(task_id)
+            selected_ids.discard(task_id)
+
+    def _toggle_select_mode() -> None:
+        select_mode.value = not select_mode.value
+        if not select_mode.value:
+            selected_ids.clear()
+        ui.timer(interval=0.01, callback=_refresh, once=True)
+
+    def _toggle_select_all() -> None:
+        """Select or deselect all tasks on the current page."""
+        current_ids = {t.id for t in current_tasks}
+        if current_ids and current_ids.issubset(set(selected_ids)):
+            # All selected → deselect all
+            selected_ids.clear()
+        else:
+            # Select all on current page
+            for tid in current_ids:
+                selected_ids.add(tid)
+        ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _set_filter(tab: str) -> None:
-        _filter_tab["value"] = tab
-        _page["value"] = 1
+        filter_tab.value = tab
+        page.value = 1
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _set_sort(val: str) -> None:
-        _sort_by["value"] = val or "latest"
-        _page["value"] = 1
+        sort_by.value = val or "latest"
+        page.value = 1
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _set_view(mode: str) -> None:
-        _view_mode["value"] = mode
-        ui.timer(interval=0.01, callback=_refresh, once=True)
-
-    def _toggle_select_mode() -> None:
-        _select_mode["value"] = not _select_mode["value"]
-        if not _select_mode["value"]:
-            _selected_ids.clear()
+        view_mode.value = mode
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _on_search_change(e: Any) -> None:
-        _search["value"] = e.args or ""
-        _page["value"] = 1
+        search.value = e.args or ""
+        page.value = 1
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _set_page_size(size: int) -> None:
-        _page_size["value"] = size
-        _page["value"] = 1
+        page_size.value = size
+        page.value = 1
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _prev_page() -> None:
-        if _page["value"] > 1:
-            _page["value"] -= 1
+        if page.value > 1:
+            page.value -= 1
             ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _next_page() -> None:
-        total_pages = max(1, math.ceil(_total_count["value"] / _page_size["value"]))
-        if _page["value"] < total_pages:
-            _page["value"] += 1
+        total_pages = max(1, math.ceil(total_count.value / page_size.value))
+        if page.value < total_pages:
+            page.value += 1
             ui.timer(interval=0.01, callback=_refresh, once=True)
 
     def _toggle_expand(task_id: int) -> None:
-        if _expanded_id["value"] == task_id:
-            _expanded_id["value"] = None
+        if expanded_id.value == task_id:
+            expanded_id.value = None
         else:
-            _expanded_id["value"] = task_id
+            expanded_id.value = task_id
         ui.timer(interval=0.01, callback=_refresh, once=True)
 
     # ── Data loading ─────────────────────────────────────────────────────
@@ -289,13 +318,10 @@ def register_tasks_page(
 
     async def _load_tasks() -> tuple[list[Any], int]:
         """Load tasks for the current page with filters."""
-        filter_statuses = _FILTER_MAP.get(_filter_tab["value"])
+        filter_statuses = _FILTER_MAP.get(filter_tab.value)
 
         async with session_factory() as session:
             repo = Repository(session)
-
-            # For simplicity, we load all tasks with the filter and paginate in Python
-            # since the repository doesn't have a dedicated task listing with all these filters
             all_tasks = await repo.list_tasks(limit=100000)
 
         # Apply status filter
@@ -303,15 +329,15 @@ def register_tasks_page(
             all_tasks = [t for t in all_tasks if t.status in filter_statuses]
 
         # Apply search filter
-        search = _search["value"].strip().lower()
-        if search:
-            all_tasks = [t for t in all_tasks if search in _video_title(t).lower()]
+        q = search.value.strip().lower()
+        if q:
+            all_tasks = [t for t in all_tasks if q in _video_title(t).lower()]
 
         # Sort
-        sort = _sort_by["value"]
-        if sort == "title":
+        s = sort_by.value
+        if s == "title":
             all_tasks = sorted(all_tasks, key=lambda t: _video_title(t).lower())
-        elif sort == "added":
+        elif s == "added":
             all_tasks = sorted(all_tasks, key=lambda t: t.created_at or datetime.datetime.min, reverse=True)
         else:  # latest — by updated_at desc
             all_tasks = sorted(all_tasks, key=lambda t: t.updated_at or t.created_at or datetime.datetime.min, reverse=True)
@@ -319,8 +345,8 @@ def register_tasks_page(
         total = len(all_tasks)
 
         # Paginate
-        offset = (_page["value"] - 1) * _page_size["value"]
-        page_tasks = list(all_tasks[offset : offset + _page_size["value"]])
+        offset = (page.value - 1) * page_size.value
+        page_tasks = list(all_tasks[offset : offset + page_size.value])
 
         return page_tasks, total
 
@@ -329,17 +355,16 @@ def register_tasks_page(
     async def _refresh() -> None:
         # Load counts
         counts = await _load_counts()
-        _tab_counts.update(counts)
+        tab_counts.update(counts)
 
         # Load tasks
         tasks, total = await _load_tasks()
-        _current_tasks.clear()
-        _current_tasks.extend(tasks)
-        _total_count["value"] = total
+        current_tasks.replace(tasks)
+        total_count.value = total
 
-        # Clean up selected IDs
+        # Clean up selected IDs that are no longer on current page
         current_ids = {t.id for t in tasks}
-        _selected_ids.intersection_update(current_ids)
+        selected_ids.intersection_update(current_ids)
 
         # ── Summary Bar ──────────────────────────────────────────────
         _containers["summary"].clear()
@@ -351,11 +376,10 @@ def register_tasks_page(
         with _containers["filters"]:
             _render_filter_tabs()
 
-        # ── Batch bar ────────────────────────────────────────────────
-        _containers["batch_bar"].clear()
-        if _select_mode["value"] and _selected_ids:
-            with _containers["batch_bar"]:
-                _render_batch_bar()
+        # ── Select Bar ────────────────────────────────────────────────
+        _containers["select_bar"].clear()
+        with _containers["select_bar"]:
+            _render_select_bar()
 
         # ── Task list ────────────────────────────────────────────────
         _containers["task_list"].clear()
@@ -363,7 +387,7 @@ def register_tasks_page(
             if not tasks:
                 ui.label(_("tasks.no_tasks")).classes("text-grey-6 py-8 text-center")
             else:
-                mode = _view_mode["value"]
+                mode = view_mode.value
                 if mode == "grid":
                     _render_grid_view(tasks)
                 elif mode == "table":
@@ -408,11 +432,9 @@ def register_tasks_page(
                     ui.separator().props("vertical").classes("h-6")
 
                     # Pipeline counts
-                    dl_count = _tab_counts.get("active", 0)
-                    # Break down active into downloading/uploading from current data
-                    dl_n = sum(1 for t in _current_tasks if t.status == TaskStatus.DOWNLOADING)
-                    ul_n = sum(1 for t in _current_tasks if t.status == TaskStatus.UPLOADING)
-                    pend_n = _tab_counts.get("pending", 0)
+                    dl_n = sum(1 for t in current_tasks if t.status == TaskStatus.DOWNLOADING)
+                    ul_n = sum(1 for t in current_tasks if t.status == TaskStatus.UPLOADING)
+                    pend_n = tab_counts.get("pending", 0)
                     ui.label(
                         _("tasks.summary.pipeline",
                           downloading=str(dl_n),
@@ -453,8 +475,8 @@ def register_tasks_page(
                 ("completed", "tasks.filter.completed"),
                 ("failed", "tasks.filter.failed"),
             ]:
-                count = _tab_counts.get(tab_key, 0)
-                is_active = _filter_tab["value"] == tab_key
+                count = tab_counts.get(tab_key, 0)
+                is_active = filter_tab.value == tab_key
                 label = f"{_(label_key)} {count}"
                 btn = ui.button(label, on_click=lambda _, k=tab_key: _set_filter(k))
                 if is_active:
@@ -462,27 +484,79 @@ def register_tasks_page(
                 else:
                     btn.props("flat dense")
 
-    # ── Batch Bar ────────────────────────────────────────────────────────
+    # ── Select Bar ────────────────────────────────────────────────────────
 
-    def _render_batch_bar() -> None:
-        with ui.row().classes("w-full items-center gap-3 py-2 px-4 bg-blue-1 rounded"):
-            ui.label(
-                _("tasks.batch.selected_count", count=str(len(_selected_ids)))
-            ).classes("text-sm font-medium")
+    def _render_select_bar() -> None:
+        """Render the Select mode toggle and Select All/Deselect All buttons."""
+        select_btn = ui.button(
+            _("tasks.select"),
+            icon="check_box" if select_mode.value else "check_box_outline_blank",
+            on_click=_toggle_select_mode,
+        )
+        if select_mode.value:
+            select_btn.props("dense color=primary")
+        else:
+            select_btn.props("dense flat")
 
-            if retry_callback is not None:
-                ui.button(
-                    _("tasks.batch.retry_selected"),
-                    icon="replay",
-                    on_click=_batch_retry,
-                ).props("flat dense color=primary")
+        if select_mode.value:
+            all_selected = bool(current_tasks) and {t.id for t in current_tasks}.issubset(set(selected_ids))
+            ui.button(
+                _("tasks.deselect_all") if all_selected else _("tasks.select_all"),
+                icon="select_all",
+                on_click=_toggle_select_all,
+            ).props("dense flat")
 
-            if cancel_callback is not None:
-                ui.button(
-                    _("tasks.batch.cancel_selected"),
-                    icon="cancel",
-                    on_click=_batch_cancel,
-                ).props("flat dense color=negative")
+    # ── Right-click context menu ─────────────────────────────────────────
+
+    def _attach_context_menu(element: Any, task: Any) -> None:
+        """Attach a right-click context menu to a UI element for a given task.
+
+        Shows per-task actions (retry/cancel/links) and, when items are
+        selected via Select mode, batch Retry Selected / Cancel Selected.
+        """
+        with element:
+            with ui.context_menu():
+                # ── Per-task actions ──────────────────────────────────
+                # Retry
+                if task.status in _RETRYABLE_STATUSES:
+                    ui.menu_item(
+                        _("tasks.retry"),
+                        on_click=lambda tid=task.id: _on_retry(tid),
+                    ).props('icon="replay"')
+                # Cancel
+                if task.status in _CANCELLABLE_STATUSES:
+                    ui.menu_item(
+                        _("tasks.cancel"),
+                        on_click=lambda tid=task.id: _on_cancel(tid),
+                    ).props('icon="cancel"')
+                # YouTube link
+                if hasattr(task, "video") and task.video:
+                    yt_url = f"https://www.youtube.com/watch?v={task.video.youtube_id}"
+                    ui.menu_item(
+                        _("tasks.youtube_link"),
+                        on_click=lambda u=yt_url: ui.navigate.to(u, new_tab=True),
+                    ).props('icon="open_in_new"')
+                # Bilibili link
+                if hasattr(task, "bilibili_bvid") and task.bilibili_bvid:
+                    bili_url = f"https://www.bilibili.com/video/{task.bilibili_bvid}"
+                    ui.menu_item(
+                        _("tasks.bilibili_link"),
+                        on_click=lambda u=bili_url: ui.navigate.to(u, new_tab=True),
+                    ).props('icon="open_in_new"')
+
+                # ── Batch actions (only when items selected) ─────────
+                if selected_ids:
+                    ui.separator()
+                    ui.menu_item(
+                        _("tasks.batch.retry_selected")
+                        + f" ({len(selected_ids)})",
+                        on_click=_batch_retry,
+                    ).props('icon="replay"')
+                    ui.menu_item(
+                        _("tasks.batch.cancel_selected")
+                        + f" ({len(selected_ids)})",
+                        on_click=_batch_cancel,
+                    ).props('icon="cancel"')
 
     # ── List View ────────────────────────────────────────────────────────
 
@@ -493,25 +567,26 @@ def register_tasks_page(
 
     def _render_list_item(task: Any) -> None:
         color = _STATUS_COLORS.get(task.status.value, "grey")
-        is_expanded = _expanded_id["value"] == task.id
+        is_expanded = expanded_id.value == task.id
         title = _video_title(task)
         thumb = _video_thumbnail(task)
         ch_name = _channel_name(task)
         date = _video_date(task)
         stats = download_stats.get(task.id, {}) if download_stats and task.status == TaskStatus.DOWNLOADING else {}
 
-        with ui.card().classes("w-full mb-1").props("flat bordered"):
+        card = ui.card().classes("w-full mb-1").props("flat bordered")
+        _attach_context_menu(card, task)
+
+        with card:
             # Main row — clickable to expand
             with ui.row().classes("w-full items-center gap-3 py-2 px-3 cursor-pointer").on(
                 "click", lambda _, tid=task.id: _toggle_expand(tid)
             ):
                 # Select checkbox (only in select mode)
-                if _select_mode["value"]:
-                    is_selected = task.id in _selected_ids
-                    cb = ui.checkbox(value=is_selected).props("dense size=xs")
+                if select_mode.value:
+                    is_sel = task.id in selected_ids
+                    cb = ui.checkbox(value=is_sel).props("dense size=xs")
                     cb.on("update:model-value", lambda e, tid=task.id: _toggle_select(tid, e.args))
-                    # Stop click propagation so checkbox doesn't trigger expand
-                    cb.on("click", lambda e: e.args, [], propagate=False) if False else None
 
                 # Thumbnail
                 if thumb:
@@ -530,7 +605,6 @@ def register_tasks_page(
 
                 # Status + progress
                 with ui.column().classes("items-end gap-1 flex-shrink-0"):
-                    # Status badge with icon
                     if task.status == TaskStatus.DOWNLOADING:
                         with ui.row().classes("items-center gap-1"):
                             ui.icon("download", size="xs", color=color)
@@ -539,31 +613,34 @@ def register_tasks_page(
                         with ui.row().classes("items-center gap-1"):
                             ui.icon("upload", size="xs", color=color)
                             ui.label(f"{_status_label(task)} {task.progress_pct:.0f}%").classes("text-xs")
-                    elif task.status == TaskStatus.COMPLETED:
-                        ui.badge(_status_label(task), color=color).props("dense")
                     elif task.status == TaskStatus.FAILED:
                         with ui.row().classes("items-center gap-1"):
                             ui.badge(_status_label(task), color=color).props("dense")
+                            # Inline retry button for failed tasks
                             ui.button(
-                                _("tasks.retry"),
                                 icon="replay",
                                 on_click=lambda _, tid=task.id: _on_retry(tid),
-                            ).props("flat dense size=xs color=primary")
+                            ).props("flat dense round size=xs color=primary").tooltip(_("tasks.retry"))
                     else:
                         ui.badge(_status_label(task), color=color).props("dense")
 
-                # Progress bar for active tasks
-                if task.status in _ACTIVE_STATUSES:
-                    with ui.element("div").classes("w-full"):
-                        render_progress_bar(task.progress_pct, color=color, size="6px")
-                        if task.status == TaskStatus.DOWNLOADING and stats:
-                            with ui.row().classes("gap-3 text-xs text-grey-6 mt-1"):
-                                ui.label(f"{_fmt_speed(stats.get('speed'))} · ETA {_fmt_eta(stats.get('eta'))}")
+            # Progress bar for active tasks
+            if task.status in _ACTIVE_STATUSES:
+                with ui.element("div").classes("w-full px-3 pb-2"):
+                    render_progress_bar(task.progress_pct, color=color, size="6px")
+                    if task.status == TaskStatus.DOWNLOADING and stats:
+                        with ui.row().classes("gap-3 text-xs text-grey-6 mt-1"):
+                            ui.label(f"{_fmt_speed(stats.get('speed'))} · ETA {_fmt_eta(stats.get('eta'))}")
 
-            # Expanded detail (accordion)
+            # Error message preview for failed tasks
+            if task.status == TaskStatus.FAILED and task.error_message and not is_expanded:
+                with ui.element("div").classes("px-3 pb-2"):
+                    ui.label(task.error_message[:120]).classes("text-xs text-red truncate")
+
+            # Expanded detail (accordion) — compact to avoid repeating row info
             if is_expanded:
                 with ui.column().classes("w-full px-4 pb-3 pt-1 border-t gap-2"):
-                    _render_task_detail(task)
+                    _render_task_detail(task, compact=True)
 
     # ── Grid View ────────────────────────────────────────────────────────
 
@@ -580,9 +657,12 @@ def register_tasks_page(
         thumb = _video_thumbnail(task)
         ch_name = _channel_name(task)
 
-        with ui.card().classes("w-full cursor-pointer").on(
+        card = ui.card().classes("w-full cursor-pointer overflow-hidden").on(
             "click", lambda _, tid=task.id: _open_detail_dialog(tid)
-        ):
+        )
+        _attach_context_menu(card, task)
+
+        with card:
             # Thumbnail
             if thumb:
                 ui.image(thumb).classes("w-full h-32 rounded object-cover")
@@ -590,14 +670,17 @@ def register_tasks_page(
                 with ui.element("div").classes("w-full h-32 bg-grey-2 rounded flex items-center justify-center"):
                     ui.icon("movie", size="xl").classes("text-grey-4")
 
-            # Title
-            ui.label(title).classes("text-sm font-medium truncate mt-2")
+            # Title — max 2 lines with ellipsis
+            ui.label(title).classes("text-sm font-medium mt-2").style(
+                "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; "
+                "overflow: hidden; text-overflow: ellipsis; word-break: break-word;"
+            )
 
-            # Channel
+            # Channel — single line truncate
             if ch_name:
                 ui.label(ch_name).classes("text-xs text-grey-6 truncate")
 
-            # Status badge
+            # Status badge + progress
             with ui.row().classes("items-center gap-2 mt-1"):
                 ui.badge(_status_label(task), color=color).props("dense")
                 if task.status in _ACTIVE_STATUSES:
@@ -607,14 +690,14 @@ def register_tasks_page(
             if task.status in _ACTIVE_STATUSES:
                 render_progress_bar(task.progress_pct, color=color, size="4px")
 
-            # Select checkbox
-            if _select_mode["value"]:
-                is_selected = task.id in _selected_ids
-                cb = ui.checkbox(value=is_selected).props("dense size=xs").classes("absolute top-2 left-2")
+            # Select checkbox overlay
+            if select_mode.value:
+                is_sel = task.id in selected_ids
+                cb = ui.checkbox(value=is_sel).props("dense size=xs").classes("absolute top-2 left-2")
                 cb.on("update:model-value", lambda e, tid=task.id: _toggle_select(tid, e.args))
 
     def _open_detail_dialog(task_id: int) -> None:
-        task = next((t for t in _current_tasks if t.id == task_id), None)
+        task = next((t for t in current_tasks if t.id == task_id), None)
         if task is None:
             return
         with ui.dialog() as dlg, ui.card().classes("w-[600px] max-h-[80vh]"):
@@ -627,13 +710,60 @@ def register_tasks_page(
 
     def _render_table_view(tasks: list[Any]) -> None:
         columns = [
-            {"name": "title", "label": _("tasks.name"), "field": "title", "align": "left", "sortable": True},
-            {"name": "channel", "label": _("tasks.channel"), "field": "channel", "align": "left"},
-            {"name": "status", "label": _("tasks.status"), "field": "status", "align": "center"},
-            {"name": "progress", "label": _("tasks.progress"), "field": "progress", "align": "right"},
-            {"name": "speed", "label": _("tasks.speed"), "field": "speed", "align": "right"},
-            {"name": "eta", "label": _("tasks.eta"), "field": "eta", "align": "right"},
-            {"name": "added", "label": _("tasks.added"), "field": "added", "align": "right"},
+            {
+                "name": "title",
+                "label": _("tasks.name"),
+                "field": "title",
+                "align": "left",
+                "sortable": True,
+                "style": "max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                "headerStyle": "max-width: 300px;",
+            },
+            {
+                "name": "channel",
+                "label": _("tasks.channel"),
+                "field": "channel",
+                "align": "left",
+                "style": "max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                "headerStyle": "max-width: 150px;",
+            },
+            {
+                "name": "status",
+                "label": _("tasks.status"),
+                "field": "status",
+                "align": "center",
+                "sortable": True,
+                "style": "width: 100px;",
+            },
+            {
+                "name": "progress",
+                "label": _("tasks.progress"),
+                "field": "progress",
+                "align": "right",
+                "style": "width: 80px;",
+            },
+            {
+                "name": "speed",
+                "label": _("tasks.speed"),
+                "field": "speed",
+                "align": "right",
+                "style": "width: 100px;",
+            },
+            {
+                "name": "eta",
+                "label": _("tasks.eta"),
+                "field": "eta",
+                "align": "right",
+                "style": "width: 80px;",
+            },
+            {
+                "name": "added",
+                "label": _("tasks.added"),
+                "field": "added",
+                "align": "right",
+                "sortable": True,
+                "style": "width: 140px;",
+            },
         ]
 
         rows = []
@@ -654,9 +784,15 @@ def register_tasks_page(
             columns=columns,
             rows=rows,
             row_key="id",
-            selection="multiple" if _select_mode["value"] else None,
         ).classes("w-full")
-        table.props("flat bordered dense")
+        table.props('flat bordered dense separator="cell" wrap-cells')
+
+        # Enable CSS resize on table columns
+        table.style("table-layout: auto;")
+        ui.add_css("""
+            .q-table th { resize: horizontal; overflow: hidden; }
+            .q-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        """)
 
         # Handle row click for expansion
         def _on_row_click(e: Any) -> None:
@@ -667,114 +803,121 @@ def register_tasks_page(
         table.on("row-click", _on_row_click)
 
         # Show expanded detail below table if any
-        if _expanded_id["value"] is not None:
-            expanded_task = next((t for t in tasks if t.id == _expanded_id["value"]), None)
+        if expanded_id.value is not None:
+            expanded_task = next((t for t in tasks if t.id == expanded_id.value), None)
             if expanded_task:
                 with ui.card().classes("w-full mt-2").props("flat bordered"):
                     with ui.column().classes("p-4"):
-                        _render_task_detail(expanded_task)
+                        _render_task_detail(expanded_task, compact=True)
 
     # ── Task Detail (shared by all views) ────────────────────────────────
 
-    def _render_task_detail(task: Any) -> None:
-        """Render full detail for a task."""
+    def _render_task_detail(task: Any, *, compact: bool = False) -> None:
+        """Render full detail for a task.
+
+        When *compact* is True (used for inline list/table expansion), the
+        thumbnail, title, channel and date are omitted because they are
+        already visible in the parent row.
+        """
         title = _video_title(task)
         thumb = _video_thumbnail(task)
         ch_name = _channel_name(task)
         color = _STATUS_COLORS.get(task.status.value, "grey")
         stats = download_stats.get(task.id, {}) if download_stats and task.status == TaskStatus.DOWNLOADING else {}
 
-        with ui.row().classes("w-full gap-4"):
-            # Large thumbnail
-            if thumb:
-                ui.image(thumb).classes("w-48 h-28 rounded object-cover flex-shrink-0")
+        if not compact:
+            with ui.row().classes("w-full gap-4"):
+                # Large thumbnail
+                if thumb:
+                    ui.image(thumb).classes("w-48 h-28 rounded object-cover flex-shrink-0")
 
-            with ui.column().classes("flex-1 gap-2"):
-                ui.label(title).classes("text-base font-bold")
-                with ui.row().classes("gap-4 text-sm text-grey-7"):
-                    if ch_name:
-                        ui.label(ch_name)
-                    date = _video_date(task)
-                    if date:
-                        ui.label(date)
+                with ui.column().classes("flex-1 gap-2"):
+                    ui.label(title).classes("text-base font-bold")
+                    with ui.row().classes("gap-4 text-sm text-grey-7"):
+                        if ch_name:
+                            ui.label(ch_name)
+                        date = _video_date(task)
+                        if date:
+                            ui.label(date)
 
-                # Status + progress
-                with ui.row().classes("items-center gap-3"):
-                    ui.badge(_status_label(task), color=color)
-                    ui.label(_("tasks.attempt", attempt=str(task.attempt))).classes("text-xs text-grey-6")
+        with ui.column().classes("w-full gap-2" if compact else "flex-1 gap-2"):
+            # Status + progress
+            with ui.row().classes("items-center gap-3"):
+                ui.badge(_status_label(task), color=color)
+                ui.label(_("tasks.attempt", attempt=str(task.attempt))).classes("text-xs text-grey-6")
 
-                if task.status in _ACTIVE_STATUSES:
-                    with ui.row().classes("w-full items-center gap-2"):
-                        with ui.element("div").classes("flex-1"):
-                            render_progress_bar(task.progress_pct, color=color, size="16px")
-                        ui.label(f"{task.progress_pct:.0f}%").classes("text-sm font-mono")
-                    if stats:
-                        with ui.row().classes("gap-4 text-xs text-grey-6"):
-                            ui.label(f"{_('tasks.speed')}: {_fmt_speed(stats.get('speed'))}")
-                            ui.label(f"{_('tasks.eta')}: {_fmt_eta(stats.get('eta'))}")
+            if task.status in _ACTIVE_STATUSES:
+                with ui.row().classes("w-full items-center gap-2"):
+                    with ui.element("div").classes("flex-1"):
+                        render_progress_bar(task.progress_pct, color=color, size="16px")
+                    ui.label(f"{task.progress_pct:.0f}%").classes("text-sm font-mono")
+                if stats:
+                    with ui.row().classes("gap-4 text-xs text-grey-6"):
+                        ui.label(f"{_('tasks.speed')}: {_fmt_speed(stats.get('speed'))}")
+                        ui.label(f"{_('tasks.eta')}: {_fmt_eta(stats.get('eta'))}")
 
-                # Error message
-                if task.error_message:
-                    with ui.card().classes("w-full bg-red-1").props("flat"):
-                        ui.label(task.error_message).classes("text-xs text-red whitespace-pre-wrap")
+            # Error message
+            if task.error_message:
+                with ui.card().classes("w-full bg-red-1").props("flat"):
+                    ui.label(task.error_message).classes("text-xs text-red whitespace-pre-wrap")
 
-                # Description
-                if hasattr(task, "video") and task.video and task.video.description:
-                    with ui.expansion(_("tasks.description"), icon="description").classes("w-full text-sm"):
-                        ui.label(task.video.description).classes("text-xs text-grey-7 whitespace-pre-wrap")
+            # Description
+            if hasattr(task, "video") and task.video and task.video.description:
+                with ui.expansion(_("tasks.description"), icon="description").classes("w-full text-sm"):
+                    ui.label(task.video.description).classes("text-xs text-grey-7 whitespace-pre-wrap")
 
-                # Links
-                with ui.row().classes("gap-2"):
-                    if hasattr(task, "video") and task.video:
-                        yt_url = f"https://www.youtube.com/watch?v={task.video.youtube_id}"
-                        ui.button(
-                            _("tasks.youtube_link"),
-                            icon="open_in_new",
-                            on_click=lambda _, u=yt_url: ui.navigate.to(u, new_tab=True),
-                        ).props("flat dense size=sm")
-                    if hasattr(task, "bilibili_bvid") and task.bilibili_bvid:
-                        bili_url = f"https://www.bilibili.com/video/{task.bilibili_bvid}"
-                        ui.button(
-                            _("tasks.bilibili_link"),
-                            icon="open_in_new",
-                            on_click=lambda _, u=bili_url: ui.navigate.to(u, new_tab=True),
-                        ).props("flat dense size=sm")
+            # Links
+            with ui.row().classes("gap-2"):
+                if hasattr(task, "video") and task.video:
+                    yt_url = f"https://www.youtube.com/watch?v={task.video.youtube_id}"
+                    ui.button(
+                        _("tasks.youtube_link"),
+                        icon="open_in_new",
+                        on_click=lambda _, u=yt_url: ui.navigate.to(u, new_tab=True),
+                    ).props("flat dense size=sm")
+                if hasattr(task, "bilibili_bvid") and task.bilibili_bvid:
+                    bili_url = f"https://www.bilibili.com/video/{task.bilibili_bvid}"
+                    ui.button(
+                        _("tasks.bilibili_link"),
+                        icon="open_in_new",
+                        on_click=lambda _, u=bili_url: ui.navigate.to(u, new_tab=True),
+                    ).props("flat dense size=sm")
 
-                # Action buttons
-                with ui.row().classes("gap-2 mt-1"):
-                    if task.status in _RETRYABLE_STATUSES:
-                        ui.button(
-                            _("tasks.retry"),
-                            icon="replay",
-                            on_click=lambda _, tid=task.id: _on_retry(tid),
-                        ).props("dense color=primary")
-                    if task.status in _CANCELLABLE_STATUSES:
-                        ui.button(
-                            _("tasks.cancel"),
-                            icon="cancel",
-                            on_click=lambda _, tid=task.id: _on_cancel(tid),
-                        ).props("dense color=negative")
+            # Action buttons
+            with ui.row().classes("gap-2 mt-1"):
+                if task.status in _RETRYABLE_STATUSES:
+                    ui.button(
+                        _("tasks.retry"),
+                        icon="replay",
+                        on_click=lambda _, tid=task.id: _on_retry(tid),
+                    ).props("dense color=primary")
+                if task.status in _CANCELLABLE_STATUSES:
+                    ui.button(
+                        _("tasks.cancel"),
+                        icon="cancel",
+                        on_click=lambda _, tid=task.id: _on_cancel(tid),
+                    ).props("dense color=negative")
 
     # ── Pagination ───────────────────────────────────────────────────────
 
     def _render_pagination() -> None:
-        total_pages = max(1, math.ceil(_total_count["value"] / _page_size["value"]))
+        total_pages = max(1, math.ceil(total_count.value / page_size.value))
         if total_pages <= 1:
             return
         with ui.row().classes("w-full justify-center items-center gap-3 py-3"):
             ui.button(icon="chevron_left", on_click=_prev_page).props(
                 "flat dense round"
-            ).set_enabled(_page["value"] > 1)
+            ).set_enabled(page.value > 1)
             ui.label(
-                _("tasks.page_info", page=str(_page["value"]), total=str(total_pages))
+                _("tasks.page_info", page=str(page.value), total=str(total_pages))
             ).classes("text-sm")
             ui.button(icon="chevron_right", on_click=_next_page).props(
                 "flat dense round"
-            ).set_enabled(_page["value"] < total_pages)
+            ).set_enabled(page.value < total_pages)
 
             ui.select(
                 {10: "10", 20: "20", 50: "50"},
-                value=_page_size["value"],
+                value=page_size.value,
                 label=_("tasks.per_page"),
                 on_change=lambda e: _set_page_size(e.value),
             ).classes("w-24").props("dense outlined")
@@ -788,7 +931,7 @@ def register_tasks_page(
         # Filter tabs
         _containers["filters"] = ui.element("div").classes("w-full")
 
-        # Toolbar: search + sort + view + select
+        # Toolbar: search + sort + view
         with ui.row().classes("w-full items-center gap-3 flex-wrap"):
             search_input = ui.input(
                 placeholder=_("tasks.search_placeholder"),
@@ -803,7 +946,7 @@ def register_tasks_page(
             ).classes("w-36").props("dense outlined").props('label="Sort"')
 
             # View mode dropdown
-            with ui.button(icon=_VIEW_ICONS[_view_mode["value"]]).props("flat dense"):
+            with ui.button(icon=_VIEW_ICONS[view_mode.value]).props("flat dense"):
                 with ui.menu():
                     for mode, icon in _VIEW_ICONS.items():
                         label_key = f"tasks.view.{mode}"
@@ -812,19 +955,8 @@ def register_tasks_page(
                             on_click=lambda _, m=mode: _set_view(m),
                         ).props(f'icon="{icon}"')
 
-            # Select mode toggle
-            select_btn = ui.button(
-                _("tasks.select"),
-                icon="check_box_outline_blank" if not _select_mode["value"] else "check_box",
-                on_click=_toggle_select_mode,
-            )
-            if _select_mode["value"]:
-                select_btn.props("dense color=primary")
-            else:
-                select_btn.props("dense flat")
-
-        # Batch actions bar
-        _containers["batch_bar"] = ui.element("div").classes("w-full")
+            # Select buttons — dynamic container, re-rendered on refresh
+            _containers["select_bar"] = ui.element("div").classes("flex items-center gap-2")
 
         # Task list
         _containers["task_list"] = ui.element("div").classes("w-full")
